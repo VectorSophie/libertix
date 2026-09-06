@@ -496,6 +496,7 @@ prepare_installer_partition_for_target_format_or_die() {
 
 wait_for_prereqs() {
     mark "005-wait-prereqs"
+    load_libertix_staging_volume_label || die "Invalid or unavailable staging volume label"
     local i label_device
     for i in $(seq 1 60); do
         local disk_ready=0
@@ -519,7 +520,7 @@ wait_for_prereqs() {
             [ -n "$found_config" ] && config_ready=1
         fi
 
-        if [ "$config_ready" -eq 0 ]; then
+        if [ "$config_ready" -eq 0 ] && [ -n "${LIBERTIX_STAGING_VOLUME_LABEL:-}" ]; then
             while read -r label_device; do
                 [ -n "$label_device" ] || continue
                 [ "$(blkid -s LABEL -o value "$label_device" 2>/dev/null || true)" = \
@@ -580,7 +581,8 @@ cleanup_windows_live_boot_artifacts() {
     windows_mnt="/mnt/libertix-windows-cleanup"
     echo "Removing temporary GRUB4DOS files from $windows_part"
     mount_ntfs_rw_or_die "$windows_part" "$windows_mnt"
-    rm -f "$windows_mnt/grldr" "$windows_mnt/grldr.mbr" "$windows_mnt/menu.lst"
+    python3 /usr/local/lib/libertix/libertix-bios-boot-payload.py \
+        "$windows_mnt" "$INSTALLATION_PLAN_ID" || die "BIOS boot payload ownership verification failed"
     sync
     umount "$windows_mnt"
 }
