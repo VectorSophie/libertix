@@ -1,0 +1,1 @@
+before=67 after=160 manual=160 min=20 max=160 sizeError=False
