@@ -1,0 +1,318 @@
+# Fork-only validation for VectorSophie/libertix pull requests.
+#
+# This branch holds no product code. Each job checks out one exact commit listed in the
+# matrix below and runs the same quality, PowerShell, WPF build and C# checks as upstream's
+# ci.yml, without its identity, release, signing, Pages, ISO or cleanup jobs. It only needs
+# read access, uses no secrets and publishes nothing except test result artifacts.
+#
+# To validate new heads, edit the matrix and push this branch.
+name: Fork validation (exact SHAs)
+
+on:
+  push:
+    branches:
+      - ci/fork-validation
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-validation-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Quality / ${{ matrix.target.label }}
+    if: github.repository == 'VectorSophie/libertix'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - label: base upstream/dev
+            sha: 91bd68483ed89a783cb18c7b7900eaa5834e1175
+          - label: "#7 GRUB icons"
+            sha: 42d6dd8c9e618ebc0b3fd452cfa17fde9060029e
+          - label: "#8 allocation screen"
+            sha: 7578ea2cd4e938717b79493409682728f31a5c6c
+          - label: "#9 distribution cards"
+            sha: 9a3aca145dd19f665d3079bb3da35a1c0d93dd44
+
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: VectorSophie/libertix
+          ref: ${{ matrix.target.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Confirm the checked-out commit
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ matrix.target.sha }}
+        run: |
+          set -Eeuo pipefail
+          actual="$(git rev-parse HEAD)"
+          printf 'Validating %s\n' "$actual"
+          printf '%s quality: validated commit `%s`\n' "${{ matrix.target.label }}" "$actual" >> "$GITHUB_STEP_SUMMARY"
+          [ "$actual" = "$EXPECTED_SHA" ]
+
+      - name: Audit deployed scripts and their protection
+        run: python3 auto_tests/tools/deployment_audit.py
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.13"
+          version: "0.9.8"
+          enable-cache: true
+          cache-dependency-glob: auto_tests/uv.lock
+
+      - name: Install native Python test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            gir1.2-gdkpixbuf-2.0 \
+            gir1.2-nm-1.0 \
+            libcairo2-dev \
+            libgirepository-2.0-dev \
+            pkg-config \
+            python3-dev \
+            python3-gi
+
+      - name: Synchronize locked test environment
+        working-directory: auto_tests
+        run: uv sync --frozen --extra dev
+
+      - name: Lint Python
+        working-directory: auto_tests
+        run: >-
+          uv run --frozen python -m ruff check
+          app tests tools ../assets/live/*.py ../iso-tools/*.py ../grub/*.py
+
+      - name: Check Python formatting
+        working-directory: auto_tests
+        run: >-
+          uv run --frozen python -m ruff format --check
+          app tests tools ../assets/live/*.py ../iso-tools/*.py ../grub/*.py
+
+      - name: Reject skipped or expected-failure tests
+        working-directory: auto_tests
+        run: |
+          uv run --frozen python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          forbidden = {"importorskip", "skip", "skipif", "xfail"}
+          violations = []
+          for path in sorted(Path("tests").rglob("*.py")):
+              tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+              for node in ast.walk(tree):
+                  if not isinstance(node, ast.Call):
+                      continue
+                  function = node.func
+                  if isinstance(function, ast.Attribute) and function.attr in forbidden:
+                      violations.append(f"{path}:{node.lineno}: {function.attr}")
+          if violations:
+              raise SystemExit(
+                  "Skipped and expected-failure tests are forbidden:\n" + "\n".join(violations)
+              )
+          PY
+
+      - name: Run Python test suite with coverage
+        working-directory: auto_tests
+        run: >-
+          uv run --frozen python -m pytest --cov=app --cov-report=term-missing --cov-fail-under=70
+          -rf --junitxml="$RUNNER_TEMP/python-tests.xml"
+
+      - name: Validate shell script syntax
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(git ls-files -z '*.sh')
+
+      - name: Run ShellCheck
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git ls-files -z '*.sh' | xargs -0 --no-run-if-empty shellcheck -x -S warning
+
+      - name: Validate versioned JSON contracts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv run --project auto_tests --frozen python -m json.tool schemas/installation-plan.schema.json >/dev/null
+          uv run --project auto_tests --frozen python -m json.tool schemas/installation-state.schema.json >/dev/null
+          uv run --project auto_tests --frozen python -m json.tool schemas/release-config.schema.json >/dev/null
+          uv run --project auto_tests --frozen python -m json.tool release-config.json >/dev/null
+
+      - name: Keep Python test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-tests-${{ matrix.target.sha }}
+          path: ${{ runner.temp }}/python-tests.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  windows:
+    name: Windows / ${{ matrix.target.label }}
+    if: github.repository == 'VectorSophie/libertix'
+    runs-on: windows-2022
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - label: base upstream/dev
+            sha: 91bd68483ed89a783cb18c7b7900eaa5834e1175
+          - label: "#7 GRUB icons"
+            sha: 42d6dd8c9e618ebc0b3fd452cfa17fde9060029e
+          - label: "#8 allocation screen"
+            sha: 7578ea2cd4e938717b79493409682728f31a5c6c
+          - label: "#9 distribution cards"
+            sha: 9a3aca145dd19f665d3079bb3da35a1c0d93dd44
+
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: VectorSophie/libertix
+          ref: ${{ matrix.target.sha }}
+          persist-credentials: false
+
+      - name: Confirm the checked-out commit
+        shell: pwsh
+        env:
+          EXPECTED_SHA: ${{ matrix.target.sha }}
+        run: |
+          $actual = git rev-parse HEAD
+          "Validating $actual"
+          "${{ matrix.target.label }} windows: validated commit ``$actual``" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          if ($actual -ne $env:EXPECTED_SHA) { throw "Checked out $actual, expected $env:EXPECTED_SHA" }
+
+      - name: Add Visual Studio MSBuild to PATH
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3
+        with:
+          vs-version: "[17.0,18.0)"
+
+      - name: Verify .NET Framework 4.8 build tools
+        shell: pwsh
+        run: |
+          $referenceAssemblies = Join-Path ${env:ProgramFiles(x86)} `
+            'Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8'
+          if (-not (Test-Path -LiteralPath $referenceAssemblies -PathType Container)) {
+            throw ".NET Framework 4.8 targeting pack is missing: $referenceAssemblies"
+          }
+          msbuild -version
+
+      - name: Validate PowerShell syntax
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or
+              $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+            throw 'Windows PowerShell 5.1 is required for product compatibility validation.'
+          }
+          $failures = [System.Collections.Generic.List[string]]::new()
+          Get-ChildItem -Path Scripts, auto_tests/app/scripts, PowerShell.Tests -Recurse -File |
+            Where-Object { $_.Extension -in '.ps1', '.psm1' } |
+            ForEach-Object {
+              $tokens = $null
+              $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile(
+                $_.FullName, [ref]$tokens, [ref]$errors)
+              foreach ($errorRecord in $errors) {
+                $failures.Add("$($_.FullName): $($errorRecord.Message)")
+              }
+            }
+          if ($failures.Count -gt 0) {
+            throw ($failures -join [Environment]::NewLine)
+          }
+
+      - name: Analyze PowerShell
+        shell: powershell
+        run: |
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 `
+            -Scope CurrentUser -Force -Repository PSGallery
+          $findings = @(
+            Invoke-ScriptAnalyzer -Path Scripts -Recurse -Settings PSScriptAnalyzerSettings.psd1 -Severity Error, Warning
+            Invoke-ScriptAnalyzer -Path auto_tests/app/scripts -Recurse -Settings PSScriptAnalyzerSettings.psd1 -Severity Error, Warning
+            Invoke-ScriptAnalyzer -Path PowerShell.Tests -Recurse -Settings PSScriptAnalyzerSettings.psd1 -Severity Error, Warning
+          )
+          $findings | Format-Table -AutoSize
+          if ($findings.Count -gt 0) {
+            throw "PSScriptAnalyzer reported $($findings.Count) finding(s)."
+          }
+
+      - name: Run PowerShell contract tests
+        shell: powershell
+        run: |
+          Install-Module -Name Pester -RequiredVersion 6.0.1 `
+            -Scope CurrentUser -Force -Repository PSGallery
+          $configuration = New-PesterConfiguration
+          $configuration.Run.Path = 'PowerShell.Tests'
+          $configuration.Run.Exit = $false
+          $configuration.Run.PassThru = $true
+          $configuration.Output.Verbosity = 'Normal'
+          $result = Invoke-Pester -Configuration $configuration
+          "Pester: passed=$($result.PassedCount) total=$($result.TotalCount) failed=$($result.FailedCount)" |
+            Out-File -Append $env:GITHUB_STEP_SUMMARY
+          if ($result.Result -ne 'Passed' -or $result.TotalCount -le 0 -or
+              $result.PassedCount -ne $result.TotalCount -or
+              $result.SkippedCount -ne 0 -or $result.NotRunCount -ne 0 -or
+              $result.InconclusiveCount -ne 0) {
+            throw "Incomplete or failed Pester tests: passed=$($result.PassedCount), total=$($result.TotalCount), skipped=$($result.SkippedCount), notRun=$($result.NotRunCount), inconclusive=$($result.InconclusiveCount)."
+          }
+
+      # Upstream stamps the file version from its identity job here. That stamping only
+      # affects version metadata, so it is skipped and the build keeps its source version.
+      - name: Build Libertix.exe
+        shell: pwsh
+        run: >-
+          msbuild Libertix.sln
+          /restore
+          /m
+          /warnaserror
+          /p:Configuration=Release
+          '/p:Platform=Any CPU'
+          /verbosity:minimal
+
+      - name: Run C# contract tests
+        shell: pwsh
+        run: |
+          $results = "$env:RUNNER_TEMP/contract-tests"
+          dotnet test Libertix.Tests\Libertix.Tests.csproj `
+            --configuration Release --no-build --no-restore --verbosity minimal `
+            --logger 'trx;LogFileName=contracts.trx' --results-directory $results
+          $testExit = $LASTEXITCODE
+          [xml]$report = Get-Content "$results/contracts.trx" -Raw
+          $all = @($report.TestRun.Results.UnitTestResult)
+          $failed = @($all | Where-Object outcome -ne 'Passed')
+          "C#: $($all.Count) results, $($failed.Count) not passed" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          foreach ($test in $failed) { "- $($test.outcome): $($test.testName)" | Out-File -Append $env:GITHUB_STEP_SUMMARY }
+          if ($testExit -ne 0) { exit $testExit }
+          & ./auto_tests/app/scripts/assert_vstest_results.ps1 -TestResultPath "$results/contracts.trx"
+
+      - name: Keep C# test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: csharp-tests-${{ matrix.target.sha }}
+          path: ${{ runner.temp }}/contract-tests/contracts.trx
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Verify standalone output shape
+        shell: pwsh
+        run: |
+          $outputDirectory = 'Standalone\bin\Release'
+          $exposedFiles = @(Get-ChildItem -LiteralPath $outputDirectory -File -ErrorAction Stop |
+            Where-Object { $_.Extension -ne '.pdb' })
+          if ($exposedFiles.Count -ne 1 -or $exposedFiles[0].Name -ne 'Libertix.exe') {
+            throw 'Standalone output must expose exactly one Libertix.exe.'
+          }
