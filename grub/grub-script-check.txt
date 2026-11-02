@@ -1,0 +1,25 @@
+grub-script-check (GRUB 2.12-1ubuntu7.3) on complete rendered menus
+
+== 3ceb8bf: grub-script-check on the rendered menu
+error: syntax error.
+error: Incorrect command.
+error: syntax error.
+error: Incorrect command.
+error: syntax error.
+Syntax error at line 31
+REJECTED (exit 1)
+  11:submenu 'Options avancées' --class efi --id libertix-advanced {
+  12:	submenu 'Options avanc'\''ees pour Linux Mint' --class submenu $menuentry_id_option 'gnulinux-advanced-u1' --class find.none {
+  28:	menuentry "Memory test (memtest86+x64.efi)" --class memtest --class memtest $menuentry_id_option 'memtest86+' { # memtest86+ 7.00 --class find.none
+  31:	menuentry 'Custom tool' --id 'custom' { echo hello; } --class find.none
+  32:	menuentry "Say \"{hi}\" now" --id "custom-quoted" --class find.none {
+  35:	menuentry 'Tool {beta}' --id 'custom-brace' --class find.none {
+
+== 42d6dd8: grub-script-check on the rendered menu
+accepted
+  11:submenu 'Options avancées' --class efi --id libertix-advanced {
+  12:	submenu 'Options avanc'\''ees pour Linux Mint' --class submenu $menuentry_id_option 'gnulinux-advanced-u1' --class find.none {
+  28:	menuentry "Memory test (memtest86+x64.efi)" --class memtest $menuentry_id_option 'memtest86+' --class find.none { # memtest86+ 7.00
+  31:	menuentry 'Custom tool' --id 'custom' --class find.none { echo hello; }
+  32:	menuentry "Say \"{hi}\" now" --id "custom-quoted" --class find.none {
+  35:	menuentry 'Tool {beta}' --id 'custom-brace' --class find.none {

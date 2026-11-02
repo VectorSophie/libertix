@@ -1,0 +1,53 @@
+Real-window input check for the allocation screen (RealInput.cs)
+
+Host: Windows 11 Pro 10.0.26200, display scaling 125% (120 DPI), Per-Monitor V2 aware harness.
+Input: OS-injected with SetCursorPos / mouse_event / keybd_event into a topmost 1070x630 window
+showing ResizeDisk with C: 476 GiB (168 GiB free, 120 GiB shrinkable) and D: on a second disk.
+offset = measured Thumb centre minus the right edge of the rendered Windows column, in DIP,
+both in page coordinates.
+
+Caveat: these runs started the window with Application.Run, which also ran Libertix's real
+App.OnStartup in the harness process and showed its permission prompt. The prompt was left
+unanswered and nothing was written under C:\LibertixInstallLogs. When the harness was changed
+not to raise Startup, its window could no longer take the foreground, so no further input was
+sent (the harness now refuses to send input unless its own window is in front).
+
+== Base 91bd68483ed89a783cb18c7b7900eaa5834e1175 (slider below the bar; offset is not meaningful
+   there, it shows how far the old thumb was from the drawn Linux boundary)
+DPI 120x120 (scale 1.25)
+initial                            size=  67 manual=  67 sizeError=False focus=PartitionSlider thumbCentre=  335.05 boundary=  886.15 offset=-551.10 DIP
+pointer drag 150 DIP left          size=  42 manual=  42 sizeError=False focus=PartitionSlider thumbCentre=  185.56 boundary=  937.81 offset=-752.26 DIP
+Left x3                            size=  39 manual=  39 sizeError=False focus=PartitionSlider thumbCentre=  167.62 boundary=  944.01 offset=-776.39 DIP
+Right x1                           size=  40 manual=  40 sizeError=False focus=PartitionSlider thumbCentre=  173.60 boundary=  941.94 offset=-768.35 DIP
+Up x1                              size=  41 manual=  41 sizeError=False focus=PartitionSlider thumbCentre=  179.58 boundary=  939.88 offset=-760.30 DIP
+Down x1                            size=  40 manual=  40 sizeError=False focus=PartitionSlider thumbCentre=  173.60 boundary=  941.94 offset=-768.35 DIP
+PageUp                             size=  45 manual=  45 sizeError=False focus=PartitionSlider thumbCentre=  203.50 boundary=  931.61 offset=-728.12 DIP
+PageDown                           size=  40 manual=  40 sizeError=False focus=PartitionSlider thumbCentre=  173.60 boundary=  941.94 offset=-768.35 DIP
+Home                               size=  20 manual=  20 sizeError=False focus=PartitionSlider thumbCentre=   54.00 boundary=  983.27 offset=-929.27 DIP
+End                                size= 160 manual= 160 sizeError=False focus=PartitionSlider thumbCentre=  891.18 boundary=  693.98 offset=197.20 DIP
+click at 25% of the slider track   size=  54 manual=  54 sizeError=False focus=PartitionSlider thumbCentre=  257.31 boundary=  913.02 offset=-655.70 DIP
+typed 42 into the size box         size=  42 manual=  42 sizeError=False focus=ManualSizeBox  thumbCentre=  185.56 boundary=  937.81 offset=-752.26 DIP
+
+== #8 before the keyboard fix (Up/Down and PageUp/PageDown reversed by IsDirectionReversed)
+Up x1                              size= 141   (base: +1)
+Down x1                            size= 142   (base: -1)
+PageUp                             size= 137   (base: +5)
+PageDown                           size= 142   (base: -5)
+
+== #8 with the keyboard fix (build of the follow-up commit's tree)
+DPI 120x120 (scale 1.25)
+initial                            size=  67 manual=  67 sizeError=False focus=PartitionSlider thumbCentre=  886.15 boundary=  886.15 offset= 0.00 DIP
+pointer drag 150 DIP left          size= 140 manual= 140 sizeError=False focus=PartitionSlider thumbCentre=  735.31 boundary=  735.31 offset= 0.00 DIP
+Left x3                            size= 143 manual= 143 sizeError=False focus=PartitionSlider thumbCentre=  729.11 boundary=  729.11 offset= 0.00 DIP
+Right x1                           size= 142 manual= 142 sizeError=False focus=PartitionSlider thumbCentre=  731.17 boundary=  731.17 offset= 0.00 DIP
+Up x1                              size= 143 manual= 143 sizeError=False focus=PartitionSlider thumbCentre=  729.11 boundary=  729.11 offset= 0.00 DIP
+Down x1                            size= 142 manual= 142 sizeError=False focus=PartitionSlider thumbCentre=  731.17 boundary=  731.17 offset= 0.00 DIP
+PageUp                             size= 147 manual= 147 sizeError=False focus=PartitionSlider thumbCentre=  720.84 boundary=  720.84 offset= 0.00 DIP
+PageDown                           size= 142 manual= 142 sizeError=False focus=PartitionSlider thumbCentre=  731.17 boundary=  731.17 offset= 0.00 DIP
+Home                               size=  20 manual=  20 sizeError=False focus=PartitionSlider thumbCentre=  983.27 boundary=  983.27 offset= 0.00 DIP
+End                                size= 160 manual= 160 sizeError=False focus=PartitionSlider thumbCentre=  693.98 boundary=  693.98 offset= 0.00 DIP
+click at 25% of the slider track   size= 127 manual= 127 sizeError=False focus=PartitionSlider thumbCentre=  762.17 boundary=  762.17 offset= 0.00 DIP
+typed 42 into the size box         size=  42 manual=  42 sizeError=False focus=ManualSizeBox  thumbCentre=  937.81 boundary=  937.81 offset= 0.00 DIP
+
+Left/Right are deliberately reversed relative to base (Left now moves the divider left, giving
+Linux more space). Up/Down, PageUp/PageDown, Home and End match base.
