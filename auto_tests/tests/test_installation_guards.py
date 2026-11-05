@@ -92,8 +92,8 @@ def test_compatibility_blocks_an_explicitly_disconnected_ac_line() -> None:
     assert 'DllImport("PowrProf.dll")' in probe
     assert "ClassifySystemBatteryState(" in probe
     assert "batteryStateStatus == 0" in probe
-    expected_power_terms = {"en": "AC power", "fr": "secteur", "es": "corriente"}
-    for language in ("en", "fr", "es"):
+    expected_power_terms = {"en": "AC power", "fr": "secteur", "es": "corriente", "ko": "전원"}
+    for language in ("en", "fr", "es", "ko"):
         messages = catalogue["languages"][language]["wpf"]
         assert messages["CompatibilityPowerCheck"].strip()
         assert messages["CompatibilityAcPowerRequired"].strip()
@@ -506,6 +506,7 @@ def test_bios_mbr_removal_uses_the_observed_postcondition(
     command = (
         'PATH="$1:$PATH"; MOCK_LAYOUT="$2"; export PATH MOCK_LAYOUT; '
         'source "$3"; DISK=/dev/mock; '
+        "sync() { :; }; partprobe() { :; }; udevadm() { :; }; "
         'remove_mbr_partition_entry_verified 3 "test removal"'
     )
 
@@ -522,6 +523,7 @@ def test_bios_mbr_removal_uses_the_observed_postcondition(
         check=False,
         capture_output=True,
         text=True,
+        timeout=10,
     )
 
     assert result.returncode == expected_returncode
@@ -550,6 +552,7 @@ def test_bios_boot_flag_update_uses_the_observed_postcondition(
     command = (
         'PATH="$1:$PATH"; MOCK_LAYOUT="$2"; export PATH MOCK_LAYOUT; '
         'source "$3"; DISK=/dev/mock; '
+        "sync() { :; }; partprobe() { :; }; udevadm() { :; }; "
         'set_mbr_active_partition_verified 1 "test boot flags"'
     )
 
@@ -566,6 +569,7 @@ def test_bios_boot_flag_update_uses_the_observed_postcondition(
         check=False,
         capture_output=True,
         text=True,
+        timeout=10,
     )
 
     assert result.returncode == expected_returncode
@@ -703,6 +707,182 @@ def test_live_rollback_restores_exact_windows_geometry_from_plan() -> None:
     assert 'resize_end="100%"' not in rollback
 
 
+@pytest.mark.parametrize(
+    "adapter_path",
+    ["assets/live/libertix-uefi-adapter.sh", "assets/live/libertix-bios-adapter.sh"],
+)
+def test_wait_for_prereqs_survives_an_unset_staging_volume_label(adapter_path: str) -> None:
+    # An unset inherited label must still reach the bounded missing-device timeout.
+    adapter = ROOT / adapter_path
+    command = r"""
+set -Eeuo pipefail
+load_libertix_staging_volume_label() { LIBERTIX_STAGING_VOLUME_LABEL=TESTLABEL; }
+mark() { return 0; }
+candidate_disks() { return 0; }
+find() { return 1; }
+blkid() {
+    case "$1" in
+        -o) echo /dev/fake-live-medium ;;
+        -s) echo "" ;;
+    esac
+}
+sleep() { return 0; }
+die() { echo "DIE: $*"; exit 1; }
+source "$1"
+unset LIBERTIX_STAGING_VOLUME_LABEL
+wait_for_prereqs
+echo "UNREACHABLE: wait_for_prereqs returned success with no disk or config ready"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", command, "wait-for-prereqs-test", str(adapter)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "unbound variable" not in result.stderr
+    assert "UNREACHABLE" not in result.stdout
+    assert "DIE: live prerequisites not ready after 60s" in result.stdout
+
+
+def test_wait_for_prereqs_requires_a_nonempty_label_for_both_firmwares() -> None:
+    # blkid reports an empty LABEL for an unlabeled partition. If
+    # LIBERTIX_STAGING_VOLUME_LABEL were compared while unset (empty), that
+    # "" = "" would wrongly mark an unrelated, unlabeled partition as the
+    # staging volume. Both adapters must require a non-empty label before
+    # attempting the comparison at all.
+    for adapter_path in (
+        "assets/live/libertix-uefi-adapter.sh",
+        "assets/live/libertix-bios-adapter.sh",
+    ):
+        adapter = read(adapter_path)
+        assert (
+            'if [ "$config_ready" -eq 0 ] && [ -n "${LIBERTIX_STAGING_VOLUME_LABEL:-}" ]; then'
+            in adapter
+        )
+
+
+def test_live_rollback_retries_disk_resolution_before_giving_up(tmp_path: Path) -> None:
+    # Rollback can fire before udev has finished exposing the target disk's
+    # partition table to blkid. Rollback must retry settling and re-resolving
+    # instead of concluding on the very first pass that no disk in the
+    # manifest matches, since a disk that is genuinely unresolvable looks
+    # identical to one udev hasn't settled yet. TARGET_DISK_SIZE_BYTES is
+    # already populated here, so the plan-reload path (covered separately
+    # below) does not apply and this test isolates the settle/retry loop.
+    rollback = ROOT / "assets/live/libertix-rollback-common.sh"
+    # resolve_target_disk_from_manifest runs inside a command substitution
+    # subshell, so its call count is tallied through a file rather than a
+    # variable, which a subshell increment would not propagate back.
+    counter_path = tmp_path / "resolve-attempts"
+    command = r"""
+source "$1"
+COUNTER_PATH="$2"
+DISK=""
+WINDOWS_PART=""
+TARGET_DISK_SIZE_BYTES=256000000000
+settle_calls=0
+load_libertix_installation_plan() { echo "UNEXPECTED RELOAD"; return 1; }
+resolve_target_disk_from_manifest() {
+    echo x >> "$COUNTER_PATH"
+    return 1
+}
+udevadm() { settle_calls=$((settle_calls + 1)); return 0; }
+sleep() { return 0; }
+resolve_rollback_storage_best_effort
+echo "rc=$?"
+echo "settle_calls=$settle_calls"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", command, "rollback-retry-test", str(rollback), str(counter_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    resolve_attempts = counter_path.read_text(encoding="utf-8").count("x")
+
+    assert "UNEXPECTED RELOAD" not in result.stdout
+    assert "rc=1" in result.stdout
+    assert "ROLLBACK: skipped because target disk is unknown" in result.stdout
+    # A single attempt would reproduce the reported bug (a disk that only
+    # needed a moment to settle gets permanently misreported as unmatched).
+    assert resolve_attempts == 10
+    assert "settle_calls=10" in result.stdout
+
+
+def test_live_rollback_reloads_the_plan_when_manifest_values_are_blank(tmp_path: Path) -> None:
+    # install-main clears TARGET_DISK_SIZE_BYTES and its sibling manifest
+    # variables (EXPECTED_PARTITION_STYLE, the partition offsets, etc.) to
+    # rollback-safe empty defaults at bootstrap, and only repopulates them at
+    # stage 010-read-config. If rollback fires from an earlier stage (e.g. an
+    # unhandled exit during 005-wait-prereqs), disk_matches_manifest rejects
+    # every disk against permanently blank expected values -- no amount of
+    # retrying resolve_target_disk_from_manifest can succeed without first
+    # reloading the plan. The runner already validated and cached it at
+    # $LOG_DIR/installation-plan.json before launching this process.
+    rollback = ROOT / "assets/live/libertix-rollback-common.sh"
+    command = r"""
+source "$1"
+LOG_DIR="$2"
+DISK=""
+WINDOWS_PART=""
+TARGET_DISK_SIZE_BYTES=""
+reload_calls=0
+load_libertix_installation_plan() {
+    reload_calls=$((reload_calls + 1))
+    [ "$1" = "$LOG_DIR/installation-plan.json" ] || { echo "WRONG PATH: $1"; return 1; }
+    TARGET_DISK_SIZE_BYTES=256000000000
+}
+resolve_target_disk_from_manifest() { return 1; }
+udevadm() { return 0; }
+sleep() { return 0; }
+resolve_rollback_storage_best_effort
+echo "reload_calls=$reload_calls"
+echo "TARGET_DISK_SIZE_BYTES=$TARGET_DISK_SIZE_BYTES"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", command, "rollback-reload-test", str(rollback), str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "WRONG PATH" not in result.stdout
+    assert "reload_calls=1" in result.stdout
+    assert "TARGET_DISK_SIZE_BYTES=256000000000" in result.stdout
+
+
+def test_live_rollback_does_not_reload_an_already_loaded_plan(tmp_path: Path) -> None:
+    rollback = ROOT / "assets/live/libertix-rollback-common.sh"
+    command = r"""
+source "$1"
+LOG_DIR="$2"
+DISK=""
+WINDOWS_PART=""
+TARGET_DISK_SIZE_BYTES=256000000000
+reload_calls=0
+load_libertix_installation_plan() { reload_calls=$((reload_calls + 1)); }
+resolve_target_disk_from_manifest() { return 1; }
+udevadm() { return 0; }
+sleep() { return 0; }
+resolve_rollback_storage_best_effort
+echo "reload_calls=$reload_calls"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", command, "rollback-no-reload-test", str(rollback), str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "reload_calls=0" in result.stdout
+
+
 @pytest.mark.parametrize("failed_transition", ["begin", "compensate", "complete"])
 def test_live_rollback_rejects_success_when_state_persistence_fails(
     failed_transition: str,
@@ -802,7 +982,10 @@ def test_windows_rollbacks_require_the_exact_original_system_partition_size() ->
     assert "[int64]$partitionSizeTolerance = $PartitionAlignmentBytes" in bios_guard
     assert "[int64]$minBytes" in bios_guard
     assert "[int64]$stagingMinBytes" in bios_guard
-    assert "[Math]::Max" not in bios_guard
+    disk_restore = bios_guard.split("$diskLayoutRestored = Invoke-RecoveryOperation", 1)[1].split(
+        "$bcdRestored =", 1
+    )[0]
+    assert "[Math]::Max" not in disk_restore
 
 
 def test_bios_downloader_verifies_bundled_aria2_before_execution() -> None:
@@ -1073,8 +1256,14 @@ def test_uefi_live_failure_restores_windows_settings_for_the_same_run() -> None:
     live_failure = agent.split("$failedRunId = Read-EnvValue -Path $liveFailed", 1)[1].split(
         "$startedRunId = Read-EnvValue -Path $liveStarted", 1
     )[0]
-    assert "-RestoreWindowsSettings" in live_failure
-    assert "-ExpectedRecoveryRunId" in live_failure
+    recovery = agent.split("function Restore-FailedLiveInstallation {", 1)[1].split(
+        "function Save-RecoveryLogs", 1
+    )[0]
+    assert "-RestoreWindowsSettings" in recovery
+    assert "-ExpectedRecoveryRunId" in recovery
+    assert live_failure.index("Restore-FailedLiveInstallation -State $state") < live_failure.index(
+        "Remove-RecoveryTasks -State $state"
+    )
     assert "Remove-PendingWindowsSharePayload" in live_failure
     assert (
         'executionState.status -in @("failed", "rollback-running", "rolled-back")' in live_failure
@@ -1247,7 +1436,8 @@ def test_offline_ntfs_resize_schedules_a_verified_windows_boot_repair() -> None:
     assert "Invoke-LibertixWindowsFilesystemRepairIfRequired" in uefi
     assert 'resizeMode -ne "live-offline"' in module
     assert 'status = "waiting-windows-filesystem-repair"' in module
-    assert 'foreach ($answer in @("Y", "O", "S"))' in module
+    assert '-StandardInputText "Y`r`nO`r`nS`r`n"' in module
+    assert '-ArgumentList @($SystemDrive, "/F") -TimeoutSeconds 120' in module
     assert "BootExecute" in module
     assert "scheduledFromBootId" in module
     assert "attemptCount -ge 2" in module
@@ -1447,7 +1637,7 @@ def test_failure_shortcut_does_not_offer_reboot_before_verified_rollback() -> No
 
     assert 'if [ "$rollback_status" = "completed" ]' in runner
     assert "$LIBERTIX_I18N_SHORTCUTS_FAILURE_BLOCKED" in runner
-    for language in ("en", "fr", "es"):
+    for language in ("en", "fr", "es", "ko"):
         translations = catalogue["languages"][language]["live"]
         blocked = translations["shortcuts_failure_blocked"]
         assert "[R]" in blocked
@@ -1560,6 +1750,7 @@ def test_uefi_firmware_fallback_uses_the_same_signed_image_with_secure_boot() ->
 def test_uefi_firmware_reads_and_deletions_fail_closed() -> None:
     firmware = read("Scripts/uefi/Libertix.Uefi.Firmware.ps1")
     staging = read("Scripts/uefi/Libertix.Uefi.Staging.ps1")
+    preflight = read("Scripts/libertix-compatibility-preflight.ps1")
 
     reader = firmware.split("function Get-FirmwareVariableReadResult", 1)[1].split(
         "function Test-FirmwareVariableExists", 1
@@ -1570,11 +1761,17 @@ def test_uefi_firmware_reads_and_deletions_fail_closed() -> None:
     fallback = staging.split("$fallbackEspDrive = $null", 1)[0].rsplit(
         'if ($BootStrategy -eq "BootNext")', 1
     )[1]
+    compatibility_reader = preflight.split("function Get-NvramVariable", 1)[1].split(
+        "function Set-NvramVariable", 1
+    )[0]
 
     assert "[LibertixFirmwareApi]::LastError()" in reader
     assert "$script:Win32ErrorEnvironmentVariableNotFound" in reader
     assert "$script:Win32ErrorNotFound" in reader
     assert "GetFirmwareEnvironmentVariable failed" in reader
+    assert "[LibertixCompatibilityNvram]::LastError()" in compatibility_reader
+    assert "if ($errorCode -ne 203)" in compatibility_reader
+    assert "GetFirmwareEnvironmentVariable($Name) failed" in compatibility_reader
     assert "DeleteFirmwareEnvironmentVariable" in deletion
     assert "if (-not $ok)" in deletion
     assert "still exists after deletion" in deletion
@@ -1668,7 +1865,7 @@ def test_release_restore_dismount_and_latest_logs_fail_closed() -> None:
 
     assert 'latest_staging="$log_root/.latest-$RUN_ID"' in log_copy
     assert 'latest_backup="$log_root/.latest-previous"' in log_copy
-    assert 'cp -a "$log_dir/." "$latest_staging/"' in log_copy
+    assert 'libertix-log-archive.py "$log_dir" "$latest_staging"' in log_copy
     assert 'mv -- "$latest_staging" "$latest_dir"' in log_copy
     assert 'cp -a "$LOG_DIR/." "$log_root/latest/"' not in log_copy
 
@@ -1830,9 +2027,9 @@ def test_native_stderr_is_never_merged_under_stop_error_policy() -> None:
     guarded_taskkill = process_module.split("function Stop-LibertixNativeProcessTree", 1)[1].split(
         "function Invoke-LibertixNativeCommand", 1
     )[0]
-    assert '$ErrorActionPreference = "Continue"' in guarded_taskkill
-    assert "$taskkillExitCode = $LASTEXITCODE" in guarded_taskkill
-    assert "$ErrorActionPreference = $previousErrorActionPreference" in guarded_taskkill
+    assert "2>&1" not in process_module
+    assert "$taskKillProcess.WaitForExit($TimeoutSeconds * 1000)" in guarded_taskkill
+    assert "$taskKillProcess.ExitCode -eq 0 -and $Process.HasExited" in guarded_taskkill
 
 
 def test_native_process_module_is_packaged_for_every_standalone_consumer() -> None:
@@ -2219,6 +2416,7 @@ def test_unattended_warning_keyboard_action_requires_proven_ui_focus() -> None:
     assert observation.index("self._capture_and_acknowledge_unattended_stage") < observation.index(
         "warning_client.disconnect"
     )
+    assert "timeout_seconds=UNATTENDED_WARNING_STAGE_TIMEOUT_SECONDS" in observation
     assert "UnattendedWarningNoButton" in focus_script
     assert "UnattendedWarningYesButton" in focus_script
     assert "$target.Current.HasKeyboardFocus" in focus_script
@@ -2670,12 +2868,16 @@ def test_unattended_failures_preserve_the_exact_cause_after_rollback() -> None:
 
 def test_process_termination_failure_never_starts_partition_rollback() -> None:
     apply_changes = read("Pages/ApplyChanges.xaml.cs")
-    types = read("Pages/ApplyChanges.Types.cs")
+    runner = read("Helpers/WindowsProcessRunner.cs")
     downloads = read("Pages/ApplyChanges.Downloads.cs")
     system = read("Pages/ApplyChanges.System.cs")
     uefi = read("Pages/ApplyChanges.Uefi.cs")
 
-    assert "class UnterminatedProcessException" in types
+    assert "class UnterminatedProcessException" in runner
+    rollback = read("Pages/ApplyChanges.Plan.cs").split("private void BeginExecutionRollback()", 1)[
+        1
+    ]
+    assert rollback.index("_processTerminationUnverified") < rollback.index("BeginRollback()")
     handler = apply_changes.split("catch (UnterminatedProcessException ex)", 1)[1].split(
         "catch (Exception ex)", 1
     )[0]
@@ -2996,6 +3198,7 @@ def test_filepool_defaults_to_a_signed_build_channel_and_supports_an_override() 
     assert 'DevelopmentSshDnsOption = "--dev-ssh-dns"' in startup
     assert "FilepoolConfig.TryCreate(" in app
     assert "if (!Build.AllowsDevelopmentFilepoolOverride)" in app
+    assert "if (!options.TryValidateBuild(Build, out error))" in app
     assert "public bool AllowsDevelopmentFilepoolOverride => IsDevelopment;" in build
     assert "public sealed class FilepoolConfig" in filepool
     assert "public string BaseUrl { get; }" in filepool
@@ -3336,7 +3539,8 @@ def test_bios_large_linux_partition_uses_fat32_staging_and_full_reservation() ->
 
     assert "InstallationSizePolicy.FromRequestedGigabytes" in apply_changes
     assert "installationSizes.StagingSizeMiB" in partitioning
-    assert "ShrinkWindowsPartitionAsync(windowsShrinkMB)" in partitioning
+    assert "ShrinkWindowsPartitionAsync(" in partitioning
+    assert "reclaimableArtifactBytes" in partitioning
     assert "useOfflineResize ? stagingMB : requestedLinuxMB" in partitioning
     assert "CreateFat32PartitionSimpleAsync(biosStagingMB)" in partitioning
     assert "the live will prepare the final" in partitioning
@@ -3535,7 +3739,10 @@ def test_bios_recovery_retries_transient_storage_capacity_refresh_failures() -> 
 def test_bios_recovery_cleanup_verifies_files_share_tasks_bcd_and_hibernation() -> None:
     recovery = read("Scripts/libertix-recovery-guard.ps1")
 
-    assert "Temporary boot payload remains:" in recovery
+    assert "Remove-LibertixBiosBootPayload" in recovery
+    assert "Temporary boot payload remains:" in read(
+        "Scripts/modules/Libertix.TemporaryArtifacts.psm1"
+    )
     assert "Pending Windows sharing payload still exists after removal." in recovery
     assert "Windows read-only Linux sharing cleanup could not be verified." in recovery
     assert '-ArgumentList @("/enum", "{bootmgr}", "/v")' in recovery
@@ -4465,7 +4672,8 @@ def test_live_logs_are_copied_completely_and_verified() -> None:
     assert "cp -f /var/log/Xorg.*.log" in helper
     assert 'umount "$target"' in helper
     assert 'mount -t ntfs-3g -o rw "$win" "$target"' in helper
-    assert 'cp -a "$LOG_DIR/." "$log_dir/"' in helper
+    assert 'libertix-log-archive.py "$LOG_DIR" "$log_dir"' in helper
+    assert "libertix-log-archive.py" in build
     assert "sha256sum > SHA256SUMS" in helper
     assert "trap cleanup_mount EXIT" in helper
     assert 'mount -t ntfs-3g -o ro "$win" "$target"' in helper
@@ -4693,6 +4901,14 @@ def test_windows_storage_waits_only_for_small_transient_free_space_deficits() ->
     assert "$stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds" in policy
     assert "Wait-LibertixWindowsFreeSpaceBudget" in bios
     assert "Wait-LibertixWindowsFreeSpaceBudget" in uefi
+    assert "-ReclaimableArtifactBytes $ReclaimableArtifactBytes" in bios
+    assert "-ReclaimableArtifactBytes $reclaimableArtifactBytes" in uefi
+    assert "FileAttributes.Compressed" in read("Pages/ApplyChanges.Bios.cs")
+    assert "[IO.FileAttributes]::Compressed" in uefi
+    assert "SparseFile" in uefi
+    assert "ReparsePoint" in uefi
+    assert "EffectiveAvailableBytes" in policy
+    assert "ReclaimableArtifactBytes" in policy
 
 
 def test_grub_generators_remain_nested_after_package_updates() -> None:
@@ -4852,6 +5068,9 @@ def test_compatibility_shrink_capacity_reserves_cloned_layout_alignment() -> Non
     assert '$firmware -eq "BIOS"' in script
     assert "$shrinkAvailable -= Get-LibertixPartitionAlignmentBytes" in script
     assert "$disk.PhysicalSectorSize % $disk.LogicalSectorSize -ne 0" in script
+    assert "[int]$stagingSizeGB = [int]$installationPolicy.storage.stagingSizeGiB" in script
+    assert "([long]$stagingSizeGB + [long]$preflightShrinkSafetyGB) * 1GB" in script
+    assert "([long]$MinimumLinuxSizeGB + [long]$preflightShrinkSafetyGB)" not in script
 
 
 def test_resize_page_keeps_exact_free_space_for_capacity_policy() -> None:
@@ -4860,7 +5079,8 @@ def test_resize_page_keeps_exact_free_space_for_capacity_policy() -> None:
     storage_policy = read("Scripts/modules/Libertix.StorageGeometry.psm1")
 
     assert "_initialFreeSpace =" in page
-    assert "systemDrive.AvailableFreeSpace / 1024.0 / 1024.0 / 1024.0" in page
+    assert "this(installationState, drive.TotalSize, drive.AvailableFreeSpace)" in page
+    assert "freeBytes / 1024.0 / 1024.0 / 1024.0" in page
     assert "_initialFreeSpace = Math.Round" not in page
     assert "_installationState.Compatibility?.ShrinkAvailableBytes" in page
     assert "InstallationSizePolicy.AvailableLinuxSizeGiB(" in page
@@ -4872,6 +5092,8 @@ def test_resize_page_keeps_exact_free_space_for_capacity_policy() -> None:
     assert "targetWindowsFreeSpaceGiB" in storage_policy
     assert "windowsFreeSpaceToleranceGiB" in storage_policy
     assert "InstallationSizePolicy.MinimumWindowsFreeSpaceGiB" in page
+    assert "if (shrinkAvailableGiB < StagingSizeGiB)" in size_policy
+    assert "Math.Min(windowsBudget, shrinkAvailableGiB)" not in size_policy
 
 
 def test_protected_account_hash_uses_a_posix_line_ending() -> None:
@@ -5274,8 +5496,12 @@ def test_postinstall_winre_and_bios_boot_checks_are_locale_independent() -> None
         )
 
     recovery_check = checks.split('"recovery"', 1)[1].split('"bitlocker"', 1)[0]
-    assert '-Arguments @("/enable")' in recovery_check
-    assert '-Arguments @("/info")' not in recovery_check
+    assert '-Arguments @("/info")' in recovery_check
+    assert '"/enable"' not in recovery_check
+    assert "Assert-RecoveryLocation" in recovery_check
+    assert "Assert-RecoveryBootEnabled" in recovery_check
+    assert "0x16000009" in checks
+    assert "0x14000008" in checks
     assert "deshabilitado" not in recovery_check
 
 
@@ -5449,3 +5675,73 @@ delete_transaction_partition_best_effort
     assert result.returncode == expected_status
     if partition_present:
         assert "transaction partition 7 is still present" in result.stdout
+
+
+def test_fallback_busy_state_uses_the_application_close_interlock() -> None:
+    page = read("Pages/UefiBootFallback.xaml.cs")
+    main = read("MainWindow.xaml.cs")
+    agent = read("Scripts/libertix-uefi-recovery-agent.ps1")
+    assert page.count("_installationState.SetInstallationRunning(true);") == 2
+    assert page.count("_installationState.SetInstallationRunning(false);") == 3
+    assert "if (_installationState.IsInstallationRunning)" in main
+    assert "HideInTrayDuringInstallation();" in main
+    assert agent.index('if ([string]$state.Phase -eq "FallbackProcessStateUnknown")') < agent.index(
+        "Test-RecoveryPayload -State $state"
+    )
+
+
+def test_startup_has_no_automatic_window_bypassing_version_validation() -> None:
+    assert "StartupUri=" not in read("App.xaml")
+    app = read("App.xaml.cs")
+    startup = app.split("protected override async void OnStartup(", 1)[1].split(
+        "internal static async Task RunValidatedStartupAsync", 1
+    )[0]
+    assert startup.index("await RunValidatedStartupAsync(") < startup.index(
+        "MainWindow = new MainWindow();"
+    )
+    assert "? ValidatePublishedVersionAsync()" in startup
+    assert ": Task.FromResult(true)" in startup
+
+
+def test_ci_executes_product_powershell_checks_in_the_51_engine() -> None:
+    workflow = read(".github/workflows/ci.yml")
+    for name in [
+        "Validate PowerShell syntax",
+        "Analyze PowerShell",
+        "Run PowerShell contract tests",
+    ]:
+        step = workflow.split(f"- name: {name}\n", 1)[1].split("\n      - name:", 1)[0]
+        assert "shell: powershell" in step
+        assert "shell: pwsh" not in step
+        if name != "Analyze PowerShell":
+            assert "$PSVersionTable.PSEdition -ne 'Desktop'" in step
+            assert "$PSVersionTable.PSVersion.Major -ne 5" in step
+            assert "$PSVersionTable.PSVersion.Minor -ne 1" in step
+
+
+def test_rollback_exceptions_cannot_reenable_retry_navigation() -> None:
+    cancellation = read("Pages/ApplyChanges.Cancellation.cs")
+    page = read("Pages/ApplyChanges.xaml.cs")
+    plan = read("Pages/ApplyChanges.Plan.cs")
+    assert "BackButton.IsEnabled = CanRetryAfterFailure(" in cancellation
+    assert "if (_isRunning || !CanRetryAfterFailure(" in page
+    begin = plan.split("private void BeginExecutionRollback()", 1)[1]
+    assert begin.index("_rollbackVerificationPending = true;") < begin.index(
+        "_executionLedger?.BeginRollback();"
+    )
+    for path, method in (
+        ("Pages/ApplyChanges.Bios.cs", "FailBiosPreparationAndRollbackAsync"),
+        ("Pages/ApplyChanges.Uefi.cs", "HandleUefiPreparationFailureAsync"),
+        ("Pages/ApplyChanges.Cancellation.cs", "RollbackUefiCancellationAsync"),
+    ):
+        body = read(path).split(f"private async Task {method}(", 1)[1]
+        body = body.split("\n        }", 1)[0]
+        assert body.index("_rollbackVerificationPending = true;") < body.index(
+            "BeginExecutionRollback();"
+        )
+        assert body.index("CompleteExecutionRollback();") < body.index(
+            "_rollbackVerificationPending = false;"
+        )
+        assert body.index("_rollbackVerificationPending = false;") < body.index(
+            "FinishInstallation(enableBackButton: true);"
+        )
